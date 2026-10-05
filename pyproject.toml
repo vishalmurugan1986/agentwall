@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sealwall"
+version = "0.1.1"
+description = "Firewall and tamper-evident audit log for AI agents using MCP"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "Vishal Murugan"}
+]
+
+[project.scripts]
+sealwall = "sealwall:main"
+
+[tool.setuptools]
+py-modules = ["sealwall"]

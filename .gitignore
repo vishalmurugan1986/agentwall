@@ -1,0 +1,28 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Audit logs & runtime traces
+audit.jsonl
+*.log
+
+# Environments
+.venv/
+env/
+venv/
+.env
+
+# IDE & Editor caches
+.vscode/
+.idea/
+.DS_Store
+
+*.pins.json

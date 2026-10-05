@@ -1,0 +1,6 @@
+{"default": "deny",
+ "deny_args": ["\\.ssh", "\\.env", "id_rsa"],
+ "rules": [{"tool": "read_*", "action": "allow"},
+           {"tool": "fetch_*", "action": "allow"},
+           {"tool": "send_*", "action": "ask", "reason": "outbound communication"},
+           {"tool": "delete_*", "action": "deny", "reason": "destructive action"}]}
