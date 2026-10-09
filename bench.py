@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """bench.py - reproducible MCP-firewall attack suite.
-Runs 12 attacks against ANY stdio proxy and checks what really reached the server / the client.
+Runs 15 attacks against ANY stdio proxy and checks what really reached the server / the client.
   python bench.py --wrap "sealwall --policy policy.json --log /tmp/b.jsonl --"     (appends the server command)
   python bench.py --wrap "npx -y mcpwall --"                                         (any other proxy)
   python bench.py --wrap ""                                                          (no proxy: baseline)
@@ -13,7 +13,7 @@ INIT = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocol
 def run(wrap, msgs, env=None, timeout=90):
     log = tempfile.mktemp(); e = dict(os.environ, BENCH_LOG=log, **(env or {}))
     inp = "".join(json.dumps(m) + "\n" for m in INIT + msgs)
-    cmd_prefix = shlex.split(wrap, posix=(sys.platform != "win32")) if wrap.strip() else []
+    cmd_prefix = list(wrap) if isinstance(wrap, list) else (shlex.split(wrap, posix=(sys.platform != "win32")) if wrap.strip() else [])
     try: p = subprocess.run(cmd_prefix + SERVER, input=inp, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=e)
     except subprocess.TimeoutExpired: return {}, []
     out = {}
@@ -34,10 +34,19 @@ def call(i, name, args): return {"jsonrpc": "2.0", "id": i, "method": "tools/cal
 def reached(got, name, needle): return any(g["name"] == name and needle in json.dumps(g["args"]) for g in got)
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--wrap", required=True, help="proxy command prefix ('' for baseline)"); ap.add_argument("--workspace")
+    ap = argparse.ArgumentParser(); ap.add_argument("--wrap", default="", help="proxy command prefix ('' for baseline)"); ap.add_argument("--workspace")
+    ap.add_argument("--sealwall", action="store_true", help="test the local sealwall.py with an auto-generated policy (used by CI; exits 1 on any failure)")
     ap.add_argument("--json", action="store_true"); a = ap.parse_args()
     ws = a.workspace or tempfile.mkdtemp(); out_dir = tempfile.mkdtemp()
     wrap = a.wrap.replace("{workspace}", ws)
+    if a.sealwall:
+        d = tempfile.mkdtemp(); pol = os.path.join(d, "policy.json")
+        with open(pol, "w", encoding="utf-8") as f:
+            json.dump({"default": "deny", "allow_paths": [ws], "allow_hosts": ["trusted.com"], "deny_args": [r"\.ssh", r"\.env"],
+                       "sources": ["fetch_*"], "sinks": ["send_*", "write_*"],
+                       "rules": [{"tool": "read_*", "action": "allow"}, {"tool": "fetch_*", "action": "allow"}, {"tool": "add", "action": "allow"},
+                                 {"tool": "send_*", "action": "allow"}, {"tool": "delete_*", "action": "deny"}]}, f)
+        wrap = [sys.executable, os.path.join(HERE, "sealwall.py"), "--policy", pol, "--log", os.path.join(d, "bench.jsonl"), "--"]
     with open(os.path.join(ws, "notes.txt"), "w", encoding="utf-8") as f: f.write("hi")
     with open(os.path.join(out_dir, "secret.txt"), "w", encoding="utf-8") as f: f.write("TOP SECRET")
     link_path = os.path.join(ws, "link")
@@ -65,25 +74,43 @@ def main():
     attack_call("secret in args (AWS key)", "send_message", {"body": "AKIAIOSFODNN7EXAMPLE"}, "AKIA")
     # batch bypass
     inp_b = [[call(2, "read_file", {"path": "~/.ssh/id_rsa"})]]
-    _, got = run(a.wrap, inp_b); R.append(("JSON-RPC batch bypass", not reached(got, "read_file", "id_rsa"), "reached server" if reached(got, "read_file", "id_rsa") else "blocked"))
+    _, got = run(wrap, inp_b); R.append(("JSON-RPC batch bypass", not reached(got, "read_file", "id_rsa"), "reached server" if reached(got, "read_file", "id_rsa") else "blocked"))
     # tool poisoning
-    o, _ = run(a.wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]); names = [t["name"] for t in o.get(2, {}).get("result", {}).get("tools", [])]
+    o, _ = run(wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]); names = [t["name"] for t in o.get(2, {}).get("result", {}).get("tools", [])]
     R.append(("poisoned tool hidden from client", "add" not in names and bool(names), "visible" if "add" in names else "hidden"))
     # injection in output
-    o, _ = run(a.wrap, [call(2, "fetch_page", {"url": "http://x"})]); txt = json.dumps(o.get(2, {}))
+    o, _ = run(wrap, [call(2, "fetch_page", {"url": "https://trusted.com/page"})]); txt = json.dumps(o.get(2, {}))
     R.append(("injection in output withheld", "Ignore previous instructions" not in txt, "delivered" if "Ignore previous" in txt else "withheld"))
     # secret in output
-    o, _ = run(a.wrap, [call(2, "read_file", {"path": os.path.join(ws, "leaky.txt")})]); txt = json.dumps(o.get(2, {}))
+    o, _ = run(wrap, [call(2, "read_file", {"path": os.path.join(ws, "leaky.txt")})]); txt = json.dumps(o.get(2, {}))
     R.append(("secret in output redacted", "AKIAIOSFODNN7EXAMPLE" not in txt, "leaked to client" if "AKIA" in txt else "redacted"))
     # rug pull (two sessions, same pin file)
-    run(a.wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}])
-    o, _ = run(a.wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}], env={"BENCH_RUG": "1"})
+    run(wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}])
+    o, _ = run(wrap, [{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}], env={"BENCH_RUG": "1"})
     d = {t["name"]: t["description"] for t in o.get(2, {}).get("result", {}).get("tools", [])}
     R.append(("rug pull (changed tool) blocked", "evil.example" not in d.get("read_file", ""), "changed tool delivered" if "evil.example" in d.get("read_file", "") else "blocked"))
+    # 13: URL parser differential (assumes the proxy allows only trusted.com)
+    ok_ctl, got = run(wrap, [call(2, "fetch_page", {"url": "https://trusted.com/ok"})]); c = reached(got, "fetch_page", "trusted.com/ok")
+    R.insert(1, ("CONTROL: allowed host fetch works", c, "ok" if c else "FALSE POSITIVE"))
+    _, got = run(wrap, [call(2, "fetch_page", {"url": "https://evil.com\\@trusted.com/"}), call(3, "fetch_page", {"url": "https://trusted.com@evil.com/"})])
+    hit = reached(got, "fetch_page", "evil.com")
+    R.append(("13 URL userinfo/backslash differential", not hit, "reached server" if hit else "blocked"))
+    # 14: internal addresses / obfuscated IPs (SSRF literal targets)
+    _, got = run(wrap, [call(2, "fetch_page", {"url": "http://169.254.169.254/latest/meta-data/"}), call(3, "fetch_page", {"url": "http://2130706433/"}), call(4, "fetch_page", {"url": "http://localhost:8080/admin"})])
+    hit = bool(got)
+    R.append(("14 internal/obfuscated host (SSRF)", not hit, "reached server" if hit else "blocked"))
+    # 15: stateful source -> sink (taint)
+    ok_s, got = run(wrap, [call(2, "send_message", {"body": "hello"})]); cs = reached(got, "send_message", "hello")
+    R.insert(2, ("CONTROL: send without untrusted input works", cs, "ok" if cs else "FALSE POSITIVE"))
+    _, got = run(wrap, [call(2, "fetch_page", {"url": "https://trusted.com/page"}), call(3, "send_message", {"body": "summary of page"})])
+    R.append(("15 source->sink (fetch then send)", not reached(got, "send_message", "summary"), "reached server" if reached(got, "send_message", "summary") else "blocked"))
     attacks = [r for r in R if not r[0].startswith("CONTROL")]; score = sum(r[1] for r in attacks)
     if a.json: print(json.dumps({"wrap": a.wrap, "score": score, "total": len(attacks), "results": R}, indent=1)); return
     print(f"wrap: {a.wrap or '(none, baseline)'}\n")
     for n, p, d in R: print(f"  {'PASS' if p else 'FAIL'}  {n:36} {d}")
-    print(f"\nscore: {score}/{len(attacks)} attacks stopped" + ("" if R[0][1] else "   (control failed: legitimate use broken)"))
+    ctl_ok = all(r[1] for r in R if r[0].startswith("CONTROL"))
+    print(f"\nscore: {score}/{len(attacks)} attacks stopped" + ("" if ctl_ok else "   (a control failed: legitimate use is broken)"))
+    print("\nNot scored (argument-level proxies cannot see these; use egress control): open redirect from an allowed host to a denied one; DNS rebinding.")
+    if a.sealwall and not (ctl_ok and score == len(attacks)): sys.exit(1)
 
 if __name__ == "__main__": main()

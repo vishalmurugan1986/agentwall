@@ -352,3 +352,65 @@ class TestSecurityAuditHardening(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_http_handler(g, "ftp://evil.com/mcp")
 
+
+
+class TestUrlPolicyAndTaint(unittest.TestCase):
+    POL = {"default": "allow", "allow_hosts": ["trusted.com", "*.docs.example.org"]}
+
+    def v(self, url, key="url", pol=None):
+        from sealwall import url_violation
+        return url_violation(pol or self.POL, {key: url})
+
+    def test_allowed_hosts_pass(self):
+        for u in ("https://trusted.com/a?b=1", "https://TRUSTED.com./x", "https://api.docs.example.org/v1"):
+            self.assertIsNone(self.v(u), u)
+
+    def test_parser_differential_vectors_rejected(self):
+        for u in ("https://evil.com\\@trusted.com/", "https://trusted.com\\@evil.com/", "https://trusted.com@evil.com/",
+                  "https://trusted.com\\.evil.com/", "https://trusted.com\t.evil.com/"):
+            self.assertIsNotNone(self.v(u), u)
+
+    def test_other_hosts_and_schemes_rejected(self):
+        for u in ("https://evil.com/", "https://trusted.com.evil.com/", "ftp://trusted.com/x", "gopher://trusted.com/"):
+            self.assertIsNotNone(self.v(u), u)
+
+    def test_internal_and_obfuscated_hosts_rejected_even_without_allowlist(self):
+        pol = {"default": "allow"}
+        for u in ("http://169.254.169.254/latest/", "http://127.0.0.1:8000/", "http://[::1]/", "http://[::ffff:127.0.0.1]/",
+                  "http://2130706433/", "http://0x7f.1/", "http://localhost/admin", "http://metadata.google.internal/"):
+            self.assertIsNotNone(self.v(u, pol=pol), u)
+        self.assertIsNone(self.v("https://example.com/", pol=pol))
+
+    def test_schemeless_url_key_checked_when_allowlist_set(self):
+        self.assertIsNotNone(self.v("evil.com/x", key="url"))
+        self.assertIsNone(self.v("trusted.com/x", key="url"))
+
+    def test_deny_hosts(self):
+        self.assertIsNotNone(self.v("https://bad.example.net/", pol={"deny_hosts": ["*.example.net"]}))
+
+    def test_url_policy_wired_into_decide(self):
+        self.assertEqual(decide(self.POL, "fetch_page", {"url": "https://evil.com\\@trusted.com/"})[0], "deny")
+
+    def test_taint_escalates_sink_after_source(self):
+        from sealwall import Guard
+        pol = {"default": "allow", "sources": ["fetch_*"], "sinks": ["send_*"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            g = Guard(pol, Audit(os.path.join(tmp, "a.jsonl")))
+            call = lambda i, n: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": n, "arguments": {}}}
+            self.assertIsNone(g.request(call(1, "send_message"))[1])              # sink alone: fine
+            self.assertIsNone(g.request(call(2, "fetch_page"))[1])               # source runs
+            fwd, reply = g.request(call(3, "send_message"))                      # sink after source: escalated, fail-closed
+            self.assertIsNone(fwd); self.assertIn("tainted", reply["error"]["message"])
+
+    def test_taint_action_deny_and_no_config_is_noop(self):
+        from sealwall import Guard
+        with tempfile.TemporaryDirectory() as tmp:
+            call = lambda i, n: {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": n, "arguments": {}}}
+            g = Guard({"default": "allow"}, Audit(os.path.join(tmp, "a.jsonl")))
+            g.request(call(1, "fetch_page")); self.assertIsNone(g.request(call(2, "send_message"))[1])
+
+    def test_benchmark_passes_against_local_sealwall(self):
+        d = os.path.dirname(os.path.abspath(__file__))
+        p = subprocess.run([sys.executable, os.path.join(d, "bench.py"), "--sealwall"], capture_output=True, text=True, timeout=240)
+        self.assertEqual(p.returncode, 0, p.stdout[-800:])
+        self.assertIn("15/15", p.stdout)

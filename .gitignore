@@ -26,3 +26,4 @@ venv/
 .DS_Store
 
 *.pins.json
+files/

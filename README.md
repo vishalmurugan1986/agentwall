@@ -5,7 +5,7 @@
   <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.9+-3776ab.svg" alt="Python 3.9+" /></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Compatible-9333ea.svg" alt="MCP Compatible" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT" /></a>
-  <a href="#running-tests"><img src="https://img.shields.io/badge/tests-29%20passed-success.svg" alt="Tests" /></a>
+  <a href="#running-tests"><img src="https://img.shields.io/badge/tests-39%20passed-success.svg" alt="Tests" /></a>
   <a href="https://github.com/vishalmurugan1986/sealwall/actions"><img src="https://github.com/vishalmurugan1986/sealwall/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/dependencies-0-black.svg" alt="Zero Dependencies" />
 </p>
@@ -198,6 +198,9 @@ Policies are defined in standard JSON format:
 - **`deny_args`**: Regular expressions evaluated across serialized arguments. Matching requests are denied regardless of tool allow rules.
 - **`block_secrets`**: When `true` (default), blocks requests containing detected API tokens, AWS keys, or private key blocks.
 - **`redact_secrets`**: When `true` (default), redacts detected credentials in tool output payloads before forwarding to the client.
+- **`allow_hosts`** / **`deny_hosts`**: Host rules for any URL in tool arguments (`example.com`, `*.example.com`). With `allow_hosts` set, only `http`/`https` URLs to listed hosts pass. URLs are parsed once and anything ambiguous is rejected (userinfo `@`, backslash in the authority, whitespace/control characters, obfuscated IPs like `2130706433`), so the proxy and the real HTTP client cannot disagree about the host.
+- **`block_private_hosts`**: When `true` (default), blocks loopback, link-local (`169.254.169.254`), private and reserved addresses, and names like `localhost` or `*.internal`.
+- **`sources`** / **`sinks`** / **`taint_action`**: Coarse session taint. Once any tool matching `sources` (e.g. `fetch_*`) has run, calls to tools matching `sinks` (e.g. `send_*`, `write_*`, `bash`) are escalated to `taint_action` (`ask` by default; fail-closed `deny` when no human is present). Taint is per proxy session; in HTTP mode it is shared by all clients of that proxy.
 - **`default`**: Fallback action when no rules match (`"deny"` recommended).
 
 ---
@@ -268,17 +271,17 @@ Configure your MCP server command in settings with `sealwall` prepended to the c
 
 ## Benchmark Suite (`bench.py`)
 
-`sealwall` includes a standalone, reproducible attack evaluation suite testing 12 distinct attack vectors against any MCP stdio proxy:
+A standalone, reproducible suite of 15 attacks plus 3 controls (legitimate use must still work). It checks what **actually reached the server or the client**, so it works against any MCP stdio proxy:
 
 ```bash
-# Baseline evaluation (unprotected server)
-python bench.py --wrap ""
-
-# Evaluation through sealwall
-python bench.py --wrap "sealwall --policy policy.json --log bench.jsonl --"
+python bench.py --wrap ""                        # baseline: no proxy (scores 0/15)
+python bench.py --sealwall                       # local sealwall.py with an auto-generated policy; exits 1 on any failure (used by CI)
+python bench.py --wrap "npx -y mcpwall --"       # any other proxy (see fairness note)
 ```
 
-### Evaluated Attack Vectors
+`--sealwall` generates a policy whose `allow_paths` points at the benchmark's temporary workspace, and which allows only `trusted.com`. A policy without `allow_paths` / `allow_hosts` will, correctly, fail the path and URL attacks.
+
+### Attacks
 
 1. Secret file access (`~/.ssh/id_rsa`)
 2. Path traversal (`../secret.txt`)
@@ -287,13 +290,22 @@ python bench.py --wrap "sealwall --policy policy.json --log bench.jsonl --"
 5. Configuration file leakage (`.env`)
 6. Destructive tool execution (`delete_file`)
 7. Credential exposure in arguments (AWS access keys)
-8. JSON-RPC batching bypass attempts
-9. Tool definition poisoning via injected directives
-10. Prompt injection in tool execution outputs
-11. Secret leakage in tool output payloads
-12. Tool definition mutation across sessions (rug-pull attacks)
+8. JSON-RPC batching bypass
+9. Tool definition poisoning
+10. Prompt injection in tool outputs
+11. Secret leakage in tool outputs
+12. Tool definition mutation across sessions (rug pull)
+13. URL parser differential (`https://evil.com\@trusted.com/`, `https://trusted.com@evil.com/`)
+14. Internal and obfuscated hosts (`169.254.169.254`, `2130706433`, `localhost`)
+15. Stateful source-to-sink: `fetch_*` followed by `send_*` in one session
 
-Evaluation results depend on policy rules (e.g., path boundaries must be configured in the policy to stop path escapes). Full methodology and reproduction steps are accessible directly in [bench.py](bench.py).
+### Known limits (reported, not scored)
+
+An argument-level proxy cannot see what the server's HTTP client does after the call: **open redirects** from an allowed host to a denied one, and **DNS rebinding**, are decided at the socket. Pair sealwall with egress control (network namespace, container network policy, or an egress proxy) for SSRF-grade protection. Multi-step lineage tracking beyond the single taint bit is also not implemented.
+
+### Fairness
+
+I wrote both sealwall and this suite, so treat sealwall's score as a regression test, not independent proof. Results depend on each tool's configuration; publish the config with any numbers. Attacks sealwall misses are welcome as issues or pull requests.
 
 ---
 

@@ -147,6 +147,54 @@ def path_violation(pol, args):
         if allow and not any(_within(p, a) for a in allow): return f"path '{v}' is outside allowed paths"
     return None
 
+import ipaddress
+
+URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+URL_KEYS = {"url", "uri", "href", "link", "endpoint", "target"}
+INTERNAL_NAMES = ("localhost", "*.localhost", "*.local", "*.internal", "metadata.google.internal")
+NUMERIC_HOST = re.compile(r"(0x[0-9a-f]+|\d+)(\.(0x[0-9a-f]+|\d+)){0,3}", re.I)
+
+def _host_match(host, pat):
+    pat = str(pat).lower().strip(".")
+    return host == pat[2:] or host.endswith(pat[1:]) if pat.startswith("*.") else host == pat
+
+def url_violation(pol, args):
+    """Argument-level URL policy. Parses once, rejects anything ambiguous (userinfo, backslash in authority,
+    control chars, obfuscated IPs) so the proxy and the real HTTP client cannot disagree about the host."""
+    allow, deny = pol.get("allow_hosts") or [], pol.get("deny_hosts") or []
+    block_internal = pol.get("block_private_hosts", True)
+    for key, v in _walk(args):
+        if not isinstance(v, str) or len(v) > 4096: continue
+        u = v.strip()
+        if u.lower().startswith("file://"): continue
+        has_scheme = bool(URL_RE.match(u))
+        if not has_scheme and not (key in URL_KEYS and allow): continue
+        if re.search(r"[\x00-\x20\x7f]", u): return f"URL '{v[:80]}' contains whitespace or control characters"
+        if not has_scheme: u = "http://" + u.lstrip("/")
+        scheme, rest = u.split("://", 1)
+        if allow and scheme.lower() not in ("http", "https"): return f"URL scheme '{scheme}' not allowed"
+        auth = re.split(r"[/?#]", rest, maxsplit=1)[0]
+        if "\\" in auth: return "backslash in URL authority (parser-differential risk)"
+        if "@" in auth: return "userinfo ('@') in URL authority (parser-differential risk)"
+        try: host = (urllib.parse.urlsplit(u).hostname or "").lower().rstrip(".")
+        except ValueError: return "malformed URL"
+        if not host: return "URL has no host"
+        try: host = host.encode("idna").decode("ascii")
+        except UnicodeError: return "invalid internationalized host"
+        try:
+            ip = ipaddress.ip_address(host)
+            ip = getattr(ip, "ipv4_mapped", None) or ip
+            if block_internal and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return f"URL host {host} is a private/internal address"
+        except ValueError:
+            if NUMERIC_HOST.fullmatch(host): return f"obfuscated numeric host '{host}'"
+            if block_internal and any(_host_match(host, p) for p in INTERNAL_NAMES): return f"URL host {host} is an internal name"
+        if any(_host_match(host, p) for p in deny): return f"URL host {host} is denied"
+        if allow and not any(_host_match(host, p) for p in allow): return f"URL host {host} is not in allow_hosts"
+    return None
+
+def _matches(tool, pats): return any(fnmatch.fnmatch(tool, p) for p in (pats or []))
+
 def classify(pol, text):
     """Optional external classifier hook: policy {"classifier": ["python", "my_clf.py"]}. Exit code != 0 means unsafe. Fails closed."""
     cmd = pol.get("classifier")
@@ -164,6 +212,8 @@ def decide(pol, tool, args):
             if re.search(rx, blob): return "deny", "secret/credential detected in arguments"
     pv = path_violation(pol, args)
     if pv: return "deny", pv
+    uv = url_violation(pol, args)
+    if uv: return "deny", uv
     for r in pol.get("rules", []):
         if fnmatch.fnmatch(tool, r["tool"]):
             return r["action"], r.get("reason", "rule " + r["tool"])
@@ -254,6 +304,7 @@ class Guard:
         s.pol, s.audit, s.interactive, s.ask_timeout = pol, audit, interactive, ask_timeout
         s.pins_path, s.accept_changes = pins_path, accept_changes
         s.pins, s.blocked, s.pending, s.lock = {}, {}, {}, threading.Lock()
+        s.tainted, s.taint_src = False, None  # session taint: set once an untrusted-source tool has run
         if pins_path and os.path.exists(pins_path):
             with open(pins_path, encoding="utf-8") as f: s.pins = json.load(f)
 
@@ -275,6 +326,9 @@ class Guard:
             tool, args = str(p.get("name", "")), p.get("arguments") or {}
             if tool in s.blocked: act, why = "deny", s.blocked[tool]
             else: act, why = decide(s.pol, tool, args)
+            if act == "allow" and s.tainted and _matches(tool, s.pol.get("sinks")):
+                act = s.pol.get("taint_action", "ask")
+                why = f"session tainted by untrusted source '{s.taint_src}'; sink '{tool}' needs review"
             if act == "ask":
                 if s.interactive:
                     act = "allow" if ask_human(tool, args, timeout=s.ask_timeout) else "deny"
@@ -284,6 +338,9 @@ class Guard:
             s.audit.write(event="tool_call", tool=tool, args=args, decision=act, reason=why)
             if act == "deny":
                 return None, {"jsonrpc": "2.0", "id": m.get("id"), "error": {"code": -32001, "message": f"Blocked by sealwall: {why}"}}
+            if not s.tainted and _matches(tool, s.pol.get("sources")):
+                s.tainted, s.taint_src = True, tool
+                s.audit.write(event="session_tainted", tool=tool)
             with s.lock:
                 if len(s.pending) > 10000: s.pending.clear()
                 s.pending[s._k(m.get("id"))] = ("call", tool)
